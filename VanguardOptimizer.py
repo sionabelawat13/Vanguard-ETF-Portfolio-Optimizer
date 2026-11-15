@@ -1,0 +1,125 @@
+"""
+TEST_DAYS is now 30 (not 12) so the out-of-sample Sharpe
+is built on enough data to actually mean something. 90 total days pulled,
+60 to train on, 30 held out to validate against.
+
+No position is protected. Current holdings go in, validated target comes
+out, trades to get there are listed at the bottom.
+"""
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from scipy.optimize import minimize
+
+# CONFIG 
+ACCOUNTS = {
+    "Siona":   {"VDE": 361, "VTV": 286, "BSV": 240, "VXUS": 70, "VGT": 249, "VBIL": 833},
+    "Shri":    {"VBIL": 775, "BSV": 500, "VDE": 361, "VGT": 249, "VTV": 244, "VIS": 10, "VHT": 7},
+    "Yash":    {"VDE": 361, "VGT": 374, "VTV": 254, "VBR": 22, "BSV": 533, "VBIL": 337, "VXUS": 160},
+    "Eshitha": {"VDE": 361, "VGT": 499, "VTV": 244, "VXUS": 10, "BSV": 462, "VBIL": 400, "VUSB": 55},
+}
+
+CANDIDATES = ["VDE", "VGT", "VTV", "VGSH", "BSV", "VFH", "VXUS", "VWO", "VBR", "VO", "VIS", "VHT"]
+
+PORTFOLIO_VALUE = 250_000
+TOTAL_LOOKBACK_DAYS = 90
+TRAIN_DAYS = 60
+TEST_DAYS = TOTAL_LOOKBACK_DAYS - TRAIN_DAYS   # 30 -- big enough to trust
+DAYS_REMAINING = 11
+RISK_FREE_RATE = 0.0
+VOL_PENALTY = 1.18
+MAX_CASH_PCT = 0.10
+MAX_SINGLE_POSITION = 0.25
+
+# PULL DATA 
+all_tickers = sorted(set(t for acct in ACCOUNTS.values() for t in acct) | set(CANDIDATES))
+raw = yf.download(all_tickers, period=f"{TOTAL_LOOKBACK_DAYS + 10}d")["Close"]
+raw = raw.tail(TOTAL_LOOKBACK_DAYS + 1)
+returns = raw.pct_change().dropna()
+latest_prices = raw.iloc[-1]
+
+train_returns = returns.iloc[:TRAIN_DAYS]
+test_returns = returns.iloc[TRAIN_DAYS:]
+print(f"Train days: {len(train_returns)}  |  Test days (held out): {len(test_returns)}")
+
+# CURRENT STATE 
+print("\n--- CURRENT STATE ---")
+for name, holdings in ACCOUNTS.items():
+    total_value = sum(s * latest_prices[t] for t, s in holdings.items())
+    print(f"{name}: invested {total_value/PORTFOLIO_VALUE:.1%}, cash {1-total_value/PORTFOLIO_VALUE:.1%}")
+
+# OPTIMIZE ON TRAIN ONLY 
+train_mean = train_returns.mean() * 252
+train_cov = train_returns.cov() * 252
+n = len(all_tickers)
+bounds = tuple((0, MAX_SINGLE_POSITION) for _ in range(n))
+constraints = [
+    {"type": "ineq", "fun": lambda w: np.sum(w) - (1 - MAX_CASH_PCT)},
+    {"type": "ineq", "fun": lambda w: 1 - np.sum(w)},
+]
+
+def neg_penalized_sharpe(w):
+    ret = np.dot(w, train_mean)
+    vol = np.sqrt(w.T @ train_cov.values @ w)
+    return 0 if vol == 0 else -(ret - RISK_FREE_RATE) / (vol ** VOL_PENALTY)
+
+init = np.array([max(1 - MAX_CASH_PCT, 0) / n] * n)
+result = minimize(neg_penalized_sharpe, init, method="SLSQP", bounds=bounds, constraints=constraints)
+target_w = dict(zip(all_tickers, result.x))
+
+# EVALUATE ON TEST (held-out, trustworthy now)
+def eval_on(ret_df, weights):
+    port_daily = ret_df.values @ weights
+    avg_d, std_d = port_daily.mean(), port_daily.std()
+    daily_rf = RISK_FREE_RATE / 252
+    sharpe_ann = 0 if std_d == 0 else (avg_d - daily_rf) / std_d * np.sqrt(252)
+    ret_window = avg_d * DAYS_REMAINING
+    vol_window = std_d * np.sqrt(DAYS_REMAINING)
+    sharpe_window = 0 if vol_window == 0 else (ret_window - RISK_FREE_RATE * DAYS_REMAINING/252) / vol_window
+    return sharpe_ann, ret_window, vol_window, sharpe_window
+
+w_vec = result.x
+train_sharpe_ann, _, _, _ = eval_on(train_returns, w_vec)
+test_sharpe_ann, test_ret, test_vol, test_sharpe_window = eval_on(test_returns, w_vec)
+
+print("\n" + "=" * 65)
+print(f"TARGET PORTFOLIO (trained on {TRAIN_DAYS}d, validated on held-out {TEST_DAYS}d)")
+print("=" * 65)
+for t in all_tickers:
+    if target_w[t] > 0.005:
+        print(f"  {t}: {target_w[t]:.1%}  (${target_w[t]*PORTFOLIO_VALUE:,.0f})")
+print(f"\n  Cash: {1 - sum(target_w.values()):.1%}")
+print(f"\n  In-sample Sharpe:     {train_sharpe_ann:.2f}")
+print(f"  Out-of-sample Sharpe: {test_sharpe_ann:.2f}  <-- this is the one to trust ({TEST_DAYS} days of real data)")
+print(f"\n  Projected over your remaining {DAYS_REMAINING} days:")
+print(f"    Return: {test_ret:+.1%}  |  Vol: {test_vol:.1%}  |  Period Sharpe: {test_sharpe_window:.2f}")
+
+gap = train_sharpe_ann - test_sharpe_ann
+if abs(gap) > 1.0:
+    print(f"\n  Note: gap of {gap:+.2f} between train/test -- still some instability, treat as a guide not gospel.")
+
+# COMPARISON: TARGET vs. DOING NOTHING 
+cur_w = np.array([sum(h.get(t, 0) * latest_prices[t] for h in ACCOUNTS.values()) / (PORTFOLIO_VALUE * len(ACCOUNTS)) for t in all_tickers])
+cur_sharpe_ann, cur_ret, cur_vol, cur_sharpe_window = eval_on(test_returns, cur_w)
+print("\n" + "=" * 65)
+print("FOR COMPARISON: your CURRENT allocation, same out-of-sample test")
+print("=" * 65)
+print(f"  Out-of-sample Sharpe if you change NOTHING: {cur_sharpe_ann:.2f}")
+print(f"  Out-of-sample Sharpe if you move to the TARGET: {test_sharpe_ann:.2f}")
+print(f"  {'TARGET IS BETTER -- worth trading' if test_sharpe_ann > cur_sharpe_ann else 'CURRENT IS BETTER OR EQUAL -- trading may not help'}")
+
+# TRADES NEEDED 
+print("\n" + "=" * 65)
+print("TRADES NEEDED -- per account")
+print("=" * 65)
+for name, holdings in ACCOUNTS.items():
+    print(f"\n--- {name} ---")
+    for t in all_tickers:
+        cur_wt = holdings.get(t, 0) * latest_prices[t] / PORTFOLIO_VALUE
+        delta = (target_w[t] - cur_wt) * PORTFOLIO_VALUE
+        if abs(delta) < 300:
+            continue
+        shares = int(abs(delta) // latest_prices[t])
+        action = "BUY " if delta > 0 else "SELL"
+        print(f"    {action} {t}: {shares} shares (~${abs(delta):,.0f})")
